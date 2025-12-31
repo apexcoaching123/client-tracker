@@ -984,11 +984,11 @@ function SignIn() {
 
     setSending(true);
     const { error } = await supabase.auth.signInWithOtp({
-      email: e,
-      options: {
-        emailRedirectTo: window.location.origin,
-      },
-    });
+  email: e,
+  options: {
+    emailRedirectTo: `${window.location.origin}/auth/callback`,
+  },
+});
     setSending(false);
 
     if (error) setError(error.message);
