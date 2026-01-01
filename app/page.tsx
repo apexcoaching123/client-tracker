@@ -51,6 +51,8 @@ type Completion = {
 };
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const DEFAULT_TASK_RULES: TaskRules = {
   onboarding: [
@@ -90,14 +92,17 @@ function formatISODate(d: Date) {
   return `${y}-${m}-${day}`;
 }
 
-function prettyDate(iso: string) {
+/**
+ * Stable formatting (no locale/Intl differences between server/client)
+ * Output example: "Thu, 1 Jan 2026"
+ */
+function prettyDateStable(iso: string) {
   const dt = parseISODate(iso);
-  return dt.toLocaleDateString(undefined, {
-    weekday: "short",
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+  const dow = DAY_SHORT[dt.getDay()];
+  const day = dt.getDate();
+  const mon = MONTH_SHORT[dt.getMonth()];
+  const year = dt.getFullYear();
+  return `${dow}, ${day} ${mon} ${year}`;
 }
 
 function daysBetween(a: Date, b: Date) {
@@ -218,17 +223,14 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
     const preSunISO = getPreviousDowBefore(client.startDate, 0); // Sunday before start
 
     const tasks: Task[] = [];
-    const day = parseISODate(dateISO).getDay();
 
     if (dateISO === preSatISO) {
-      // Saturday onboarding rule(s)
       for (const r of onboarding) {
         if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
       }
     }
 
     if (dateISO === preSunISO) {
-      // Sunday onboarding rule(s)
       for (const r of onboarding) {
         if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
       }
@@ -281,16 +283,23 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
 }
 
 export default function Page() {
-  const todayISO = useMemo(() => formatISODate(new Date()), []);
-  const [dateISO, setDateISO] = useState(todayISO);
+  /**
+   * Hydration fix:
+   * - Render nothing until we're mounted in the browser.
+   * - Avoid server/client date formatting differences.
+   */
+  const [mounted, setMounted] = useState(false);
 
+  const [todayISO, setTodayISO] = useState<string>("");
+
+  const [dateISO, setDateISO] = useState<string>("");
   const [clients, setClients] = useState<Client[]>([]);
   const [taskRules, setTaskRules] = useState<TaskRules>(DEFAULT_TASK_RULES);
   const [completion, setCompletion] = useState<Completion>({});
 
   // Add client
   const [newName, setNewName] = useState("");
-  const [newStart, setNewStart] = useState(todayISO);
+  const [newStart, setNewStart] = useState<string>("");
   const [newProgram, setNewProgram] = useState<ProgramType>("12w");
   const [newGoal, setNewGoal] = useState<ClientGoal>("fat_loss");
 
@@ -316,6 +325,13 @@ export default function Page() {
   const [dismissProgramBanner, setDismissProgramBanner] = useState(false);
 
   useEffect(() => {
+    // mark mounted + set "today" only in the browser
+    setMounted(true);
+    const t = formatISODate(new Date());
+    setTodayISO(t);
+    setDateISO(t);
+    setNewStart(t);
+
     const st = loadState();
     if (st?.clients) {
       setClients(
@@ -332,8 +348,9 @@ export default function Page() {
   }, []);
 
   useEffect(() => {
+    if (!mounted) return;
     saveState({ clients, taskRules, completion });
-  }, [clients, taskRules, completion]);
+  }, [clients, taskRules, completion, mounted]);
 
   function isChecked(dateKey: string, clientId: string, taskId: string) {
     return !!completion?.[dateKey]?.[clientId]?.[taskId];
@@ -359,7 +376,7 @@ export default function Page() {
     const c: Client = { id: uid(), name, startDate: newStart, program: newProgram, goal: newGoal, notes: "" };
     setClients((prev) => [...prev, c]);
     setNewName("");
-    setNewStart(todayISO);
+    setNewStart(todayISO || formatISODate(new Date()));
     setNewProgram("12w");
     setNewGoal("fat_loss");
   }
@@ -398,24 +415,25 @@ export default function Page() {
     });
   }
 
-  const dayName = DAY_NAMES[parseISODate(dateISO).getDay()];
-  const weekDates = useMemo(() => getWeekDates(dateISO), [dateISO]);
+  const dayName = dateISO ? DAY_NAMES[parseISODate(dateISO).getDay()] : "";
+  const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
 
-  // Separate upcoming vs active (based on selected date)
   const upcomingClients = useMemo(() => {
+    if (!dateISO) return [];
     return clients
       .filter((c) => isAfterISO(c.startDate, dateISO))
       .sort((a, b) => a.startDate.localeCompare(b.startDate));
   }, [clients, dateISO]);
 
   const activeClients = useMemo(() => {
+    if (!dateISO) return [];
     return clients
       .filter((c) => !isAfterISO(c.startDate, dateISO))
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [clients, dateISO]);
 
-  // Build base rows for ACTIVE clients only (tracker)
   const baseRows = useMemo(() => {
+    if (!dateISO) return [];
     return activeClients.map((c) => {
       const day = generateTasksForClientOnDate(c, dateISO, taskRules);
       const week = weekDates.map((d) => generateTasksForClientOnDate(c, d, taskRules));
@@ -423,7 +441,6 @@ export default function Page() {
     });
   }, [activeClients, dateISO, taskRules, weekDates]);
 
-  // Search filter
   const searchedRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return baseRows;
@@ -434,24 +451,10 @@ export default function Page() {
     });
   }, [baseRows, search]);
 
-  // Count incomplete for sorting and summary
   function countIncompleteDay(clientId: string, tasks: Task[]) {
     return tasks.reduce((acc, t) => acc + (isChecked(dateISO, clientId, t.id) ? 0 : 1), 0);
   }
 
-  function countIncompleteWeek(clientId: string, weekData: Array<{ week: number; tasks: Task[] }>) {
-    let count = 0;
-    for (let i = 0; i < weekDates.length; i++) {
-      const d = weekDates[i];
-      const tasks = weekData[i].tasks;
-      for (const t of tasks) {
-        if (!isChecked(d, clientId, t.id)) count += 1;
-      }
-    }
-    return count;
-  }
-
-  // Sort (day/week logic kept as you had it, but without the day/week toggle UI)
   const sortedRows = useMemo(() => {
     const rows = [...searchedRows];
 
@@ -466,7 +469,6 @@ export default function Page() {
         return a.client.name.localeCompare(b.client.name);
       }
 
-      // default: week (ascending)
       if (a.day.week !== b.day.week) return a.day.week - b.day.week;
       return a.client.name.localeCompare(b.client.name);
     });
@@ -474,7 +476,6 @@ export default function Page() {
     return rows;
   }, [searchedRows, sortBy, dateISO, completion]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Progress (selected day only)
   const progress = useMemo(() => {
     let total = 0;
     let done = 0;
@@ -487,7 +488,6 @@ export default function Page() {
     return { total, done };
   }, [sortedRows, dateISO, completion]);
 
-  // Program banner alerts (2nd last / last week)
   const programAlerts = useMemo(() => {
     const alerts: Array<{ client: Client; label: "secondLast" | "last" }> = [];
 
@@ -504,11 +504,9 @@ export default function Page() {
   }, [sortedRows]);
 
   useEffect(() => {
-    // reset banner per date so it can show again on another day
     setDismissProgramBanner(false);
   }, [dateISO]);
 
-  // Overdue (last N days, before selected date)
   const overdue = useMemo(() => {
     const results: Array<{
       client: Client;
@@ -516,6 +514,8 @@ export default function Page() {
       week: number;
       task: Task;
     }> = [];
+
+    if (!dateISO) return results;
 
     for (const row of sortedRows) {
       const c = row.client;
@@ -543,7 +543,6 @@ export default function Page() {
     return results;
   }, [sortedRows, dateISO, completion, taskRules]);
 
-  // All clients page sorting
   const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
   const allClientsSorted = useMemo(() => {
     const arr = [...clients];
@@ -556,6 +555,9 @@ export default function Page() {
     });
     return arr;
   }, [clients, allClientsSort]);
+
+  // IMPORTANT: prevents hydration mismatch by not rendering server HTML at all.
+  if (!mounted) return null;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -624,7 +626,7 @@ export default function Page() {
                   onChange={(e) => setDateISO(e.target.value)}
                   className="rounded-xl border border-slate-300 px-3 py-2 text-sm"
                 />
-                <div className="text-sm text-slate-700">{prettyDate(dateISO)}</div>
+                <div className="text-sm text-slate-700">{prettyDateStable(dateISO)}</div>
               </div>
             </div>
 
@@ -768,7 +770,7 @@ export default function Page() {
                   <div className="mt-1 text-xs text-slate-500">
                     End date:{" "}
                     <span className="font-medium text-slate-700">
-                      {getProgramEndDateISO({ startDate: newStart, program: newProgram })}
+                      {newStart ? getProgramEndDateISO({ startDate: newStart, program: newProgram }) : ""}
                     </span>
                   </div>
                 </div>
@@ -968,7 +970,6 @@ export default function Page() {
                     </div>
 
                     <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
-                      {/* All/Incomplete hard left, Sort hard right */}
                       <div className="flex w-full sm:w-auto justify-between gap-2">
                         <div className="flex rounded-xl border border-slate-200 bg-slate-50 p-1">
                           <button
@@ -1020,7 +1021,6 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Program reminder banner */}
                 {!dismissProgramBanner && programAlerts.length > 0 && (
                   <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4">
                     <div className="flex items-start justify-between gap-3">
@@ -1147,7 +1147,6 @@ export default function Page() {
                             </button>
                           </div>
 
-                          {/* Notes */}
                           <div className="mt-3">
                             <label className="text-xs uppercase tracking-wide text-slate-500">Notes</label>
                             <textarea
@@ -1158,7 +1157,6 @@ export default function Page() {
                             />
                           </div>
 
-                          {/* Tasks */}
                           <div className="mt-3">
                             {tasksToShow.length === 0 ? (
                               <div className="text-sm text-slate-600">No scheduled tasks for this client today.</div>
