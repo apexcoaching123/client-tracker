@@ -1,12 +1,16 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+export const dynamic = "force-dynamic";
+
 export async function GET(request: Request) {
-  const requestUrl = new URL(request.url);
-  const code = requestUrl.searchParams.get("code");
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+
+  const redirectTo = url.searchParams.get("redirectTo") ?? "/";
 
   if (!code) {
-    return NextResponse.redirect(new URL("/", requestUrl.origin));
+    return NextResponse.redirect(new URL("/?error=missing_code", url.origin));
   }
 
   const supabase = createClient(
@@ -16,5 +20,5 @@ export async function GET(request: Request) {
 
   await supabase.auth.exchangeCodeForSession(code);
 
-  return NextResponse.redirect(new URL("/", requestUrl.origin));
+  return NextResponse.redirect(new URL(redirectTo, url.origin));
 }
