@@ -69,7 +69,7 @@ const DEFAULT_TASK_RULES: TaskRules = {
   week: [{ id: "wk3", week: 3, title: "Send Referral Message" }],
 };
 
-// -------------------- Small helpers --------------------
+// -------------------- Helpers --------------------
 
 function clsx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
@@ -116,7 +116,6 @@ function addDaysISO(iso: string, days: number) {
 }
 
 function isBeforeISO(aISO: string, bISO: string) {
-  // safe because YYYY-MM-DD string compares lexicographically
   return aISO < bISO;
 }
 
@@ -188,7 +187,6 @@ function uid() {
 // returns the most recent day-of-week strictly BEFORE a given date
 function getPreviousDowBefore(dateISO: string, dow: number) {
   const d = parseISODate(dateISO);
-  // step back 1 day at least
   d.setDate(d.getDate() - 1);
   while (d.getDay() !== dow) d.setDate(d.getDate() - 1);
   return formatISODate(d);
@@ -197,29 +195,18 @@ function getPreviousDowBefore(dateISO: string, dow: number) {
 function generateTasksForClientOnDate(client: Client, dateISO: string, rules: TaskRules) {
   const { onboarding, weekly, week: weekRules } = normalizeRules(rules);
 
-  // UPCOMING clients (date before start): no weekly/milestone/program tasks
-  // BUT: show pre-start weekend tasks (Sat/Sun before start date)
+  // UPCOMING clients (date before start): only pre-start weekend onboarding tasks
   if (isBeforeISO(dateISO, client.startDate)) {
-    const preSatISO = getPreviousDowBefore(client.startDate, 6); // Saturday before start
-    const preSunISO = getPreviousDowBefore(client.startDate, 0); // Sunday before start
+    const preSatISO = getPreviousDowBefore(client.startDate, 6);
+    const preSunISO = getPreviousDowBefore(client.startDate, 0);
 
     const tasks: Task[] = [];
-    const day = parseISODate(dateISO).getDay();
-
     if (dateISO === preSatISO) {
-      // Saturday onboarding rule(s)
-      for (const r of onboarding) {
-        if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
-      }
+      for (const r of onboarding) if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
     }
-
     if (dateISO === preSunISO) {
-      // Sunday onboarding rule(s)
-      for (const r of onboarding) {
-        if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
-      }
+      for (const r of onboarding) if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
     }
-
     return { week: 0, tasks, upcoming: true as const };
   }
 
@@ -231,20 +218,14 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
 
   // Onboarding (Week 1 only)
   if (week === 1) {
-    for (const r of onboarding) {
-      if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
-    }
+    for (const r of onboarding) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
   }
 
   // Weekly
-  for (const r of weekly) {
-    if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
-  }
+  for (const r of weekly) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
 
   // Milestones
-  for (const r of weekRules) {
-    if (r.week === week) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "milestone" });
-  }
+  for (const r of weekRules) if (r.week === week) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "milestone" });
 
   // Program reminders (2nd last + last week)
   const totalWeeks = getProgramTotalWeeks(client);
@@ -279,17 +260,22 @@ async function fetchCloudState(): Promise<{ clients?: Client[]; taskRules?: Task
 }
 
 async function saveCloudState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
-  await fetch("/api/state", {
+  const res = await fetch("/api/state", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(state),
   });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Save failed: ${res.status} ${t}`);
+  }
 }
 
 // -------------------- Page --------------------
 
 export default function Page() {
-  // Hydration-safe: only compute "today" after mount
+  // ✅ ALL hooks must be above any conditional return
+
   const [mounted, setMounted] = useState(false);
 
   const [todayISO, setTodayISO] = useState<string>("");
@@ -315,6 +301,9 @@ export default function Page() {
   const [taskFilter, setTaskFilter] = useState<"all" | "incomplete">("all");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<"name" | "week" | "start" | "incomplete">("week");
+
+  // All clients page sorting ✅ moved up (was causing crash)
+  const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
 
   // Overdue lookback
   const OVERDUE_LOOKBACK_DAYS = 30;
@@ -357,7 +346,6 @@ export default function Page() {
       if (st?.completion) setCompletion(st.completion);
 
       setCloudLoaded(true);
-      // prevent first save from wiping/loading jitter
       skipNextSaveRef.current = true;
     })();
   }, []);
@@ -366,14 +354,15 @@ export default function Page() {
   useEffect(() => {
     if (!mounted || !cloudLoaded) return;
 
-    // Skip the very first save right after initial load
     if (skipNextSaveRef.current) {
       skipNextSaveRef.current = false;
       return;
     }
 
     const t = setTimeout(() => {
-      saveCloudState({ clients, taskRules, completion }).catch(console.error);
+      saveCloudState({ clients, taskRules, completion }).catch((e) => {
+        console.error(e);
+      });
     }, 400);
 
     return () => clearTimeout(t);
@@ -423,12 +412,8 @@ export default function Page() {
     const id = uid();
     setTaskRules((prev) => {
       const safe = normalizeRules(prev);
-      if (ruleType === "onboarding") {
-        return { ...safe, onboarding: [...safe.onboarding, { id, day: Number(ruleDay), title }] };
-      }
-      if (ruleType === "weekly") {
-        return { ...safe, weekly: [...safe.weekly, { id, day: Number(ruleDay), title }] };
-      }
+      if (ruleType === "onboarding") return { ...safe, onboarding: [...safe.onboarding, { id, day: Number(ruleDay), title }] };
+      if (ruleType === "weekly") return { ...safe, weekly: [...safe.weekly, { id, day: Number(ruleDay), title }] };
       return { ...safe, week: [...safe.week, { id, week: Math.max(1, Number(ruleWeek) || 1), title }] };
     });
 
@@ -442,35 +427,20 @@ export default function Page() {
     });
   }
 
-  // If not mounted yet, render a simple loading screen to avoid hydration issues
-  if (!mounted || !dateISO) {
-    return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
-        <div className="rounded-2xl bg-white border border-slate-200 shadow-sm p-6 text-sm text-slate-700">
-          Loading…
-        </div>
-      </div>
-    );
-  }
+  const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
 
-  const dayName = DAY_NAMES[parseISODate(dateISO).getDay()];
-  const weekDates = useMemo(() => getWeekDates(dateISO), [dateISO]);
-
-  // Separate upcoming vs active (based on selected date)
   const upcomingClients = useMemo(() => {
-    return clients
-      .filter((c) => isAfterISO(c.startDate, dateISO))
-      .sort((a, b) => a.startDate.localeCompare(b.startDate));
+    if (!dateISO) return [];
+    return clients.filter((c) => isAfterISO(c.startDate, dateISO)).sort((a, b) => a.startDate.localeCompare(b.startDate));
   }, [clients, dateISO]);
 
   const activeClients = useMemo(() => {
-    return clients
-      .filter((c) => !isAfterISO(c.startDate, dateISO))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    if (!dateISO) return [];
+    return clients.filter((c) => !isAfterISO(c.startDate, dateISO)).sort((a, b) => a.name.localeCompare(b.name));
   }, [clients, dateISO]);
 
-  // Build base rows for ACTIVE clients only (tracker)
   const baseRows = useMemo(() => {
+    if (!dateISO) return [];
     return activeClients.map((c) => {
       const day = generateTasksForClientOnDate(c, dateISO, taskRules);
       const week = weekDates.map((d) => generateTasksForClientOnDate(c, d, taskRules));
@@ -478,7 +448,6 @@ export default function Page() {
     });
   }, [activeClients, dateISO, taskRules, weekDates]);
 
-  // Search filter
   const searchedRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return baseRows;
@@ -489,105 +458,70 @@ export default function Page() {
     });
   }, [baseRows, search]);
 
-  // Count incomplete for sorting and summary
   function countIncompleteDay(clientId: string, tasks: Task[]) {
     return tasks.reduce((acc, t) => acc + (isChecked(dateISO, clientId, t.id) ? 0 : 1), 0);
   }
 
-  // Sort
   const sortedRows = useMemo(() => {
     const rows = [...searchedRows];
-
     rows.sort((a, b) => {
       if (sortBy === "name") return a.client.name.localeCompare(b.client.name);
       if (sortBy === "start") return a.client.startDate.localeCompare(b.client.startDate);
-
       if (sortBy === "incomplete") {
         const ai = countIncompleteDay(a.client.id, a.day.tasks);
         const bi = countIncompleteDay(b.client.id, b.day.tasks);
         if (bi !== ai) return bi - ai;
         return a.client.name.localeCompare(b.client.name);
       }
-
-      // default: week (ascending)
       if (a.day.week !== b.day.week) return a.day.week - b.day.week;
       return a.client.name.localeCompare(b.client.name);
     });
-
     return rows;
   }, [searchedRows, sortBy, dateISO, completion]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Progress (selected day only)
   const progress = useMemo(() => {
     let total = 0;
     let done = 0;
     for (const row of sortedRows) {
       total += row.day.tasks.length;
-      for (const t of row.day.tasks) {
-        if (isChecked(dateISO, row.client.id, t.id)) done += 1;
-      }
+      for (const t of row.day.tasks) if (isChecked(dateISO, row.client.id, t.id)) done += 1;
     }
     return { total, done };
   }, [sortedRows, dateISO, completion]);
 
-  // Program banner alerts (2nd last / last week)
   const programAlerts = useMemo(() => {
     const alerts: Array<{ client: Client; label: "secondLast" | "last" }> = [];
-
     for (const row of sortedRows) {
       const c = row.client;
       const week = row.day.week;
       const total = getProgramTotalWeeks(c);
-
       if (week === total - 1) alerts.push({ client: c, label: "secondLast" });
       if (week === total) alerts.push({ client: c, label: "last" });
     }
-
     return alerts;
   }, [sortedRows]);
 
   useEffect(() => {
-    // reset banner per date so it can show again on another day
     setDismissProgramBanner(false);
   }, [dateISO]);
 
-  // Overdue (last N days, before selected date)
   const overdue = useMemo(() => {
-    const results: Array<{
-      client: Client;
-      dateISO: string;
-      week: number;
-      task: Task;
-    }> = [];
-
+    const results: Array<{ client: Client; dateISO: string; week: number; task: Task }> = [];
     for (const row of sortedRows) {
       const c = row.client;
-
       for (let i = 1; i <= OVERDUE_LOOKBACK_DAYS; i++) {
         const dISO = addDaysISO(dateISO, -i);
-
         if (isBeforeISO(dISO, c.startDate)) continue;
-
         const { week, tasks } = generateTasksForClientOnDate(c, dISO, taskRules);
-
         for (const t of tasks) {
-          if (!isChecked(dISO, c.id, t.id)) {
-            results.push({ client: c, dateISO: dISO, week, task: t });
-          }
+          if (!isChecked(dISO, c.id, t.id)) results.push({ client: c, dateISO: dISO, week, task: t });
         }
       }
     }
-
-    results.sort((a, b) => {
-      if (a.dateISO !== b.dateISO) return a.dateISO.localeCompare(b.dateISO);
-      return a.client.name.localeCompare(b.client.name);
-    });
-
+    results.sort((a, b) => (a.dateISO !== b.dateISO ? a.dateISO.localeCompare(b.dateISO) : a.client.name.localeCompare(b.client.name)));
     return results;
   }, [sortedRows, dateISO, completion, taskRules]);
 
-  // All clients page sorting
-  const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
   const allClientsSorted = useMemo(() => {
     const arr = [...clients];
     arr.sort((a, b) => {
@@ -600,6 +534,19 @@ export default function Page() {
     return arr;
   }, [clients, allClientsSort]);
 
+  // ✅ Now it’s safe to conditionally return
+  if (!mounted || !dateISO) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
+        <div className="rounded-2xl bg-white border border-slate-200 shadow-sm p-6 text-sm text-slate-700">
+          Loading…
+        </div>
+      </div>
+    );
+  }
+
+  const dayName = DAY_NAMES[parseISODate(dateISO).getDay()];
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <div className="mx-auto max-w-6xl p-6">
@@ -607,12 +554,9 @@ export default function Page() {
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Client Tracker</h1>
-              <p className="text-slate-600 mt-1">
-                Cloud saved (Supabase) • Accessible on any computer
-              </p>
+              <p className="text-slate-600 mt-1">Cloud saved (Supabase) • Accessible on any computer</p>
             </div>
 
-            {/* Hamburger menu */}
             <div className="relative">
               <button
                 onClick={() => setMenuOpen((v) => !v)}
@@ -681,7 +625,6 @@ export default function Page() {
           </div>
         </header>
 
-        {/* ALL CLIENTS PAGE */}
         {activePage === "allClients" ? (
           <section className="mt-6 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
             <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
@@ -725,9 +668,7 @@ export default function Page() {
                     allClientsSorted.map((c) => (
                       <tr key={c.id} className="border-t border-slate-200">
                         <td className="p-3 font-medium">{c.name}</td>
-                        <td className="p-3">
-                          {c.goal === "fat_loss" ? "Fat loss" : "Muscle gain"}
-                        </td>
+                        <td className="p-3">{c.goal === "fat_loss" ? "Fat loss" : "Muscle gain"}</td>
                         <td className="p-3">{c.startDate}</td>
                         <td className="p-3">{getProgramEndDateISO(c)}</td>
                         <td className="p-3">
@@ -752,13 +693,8 @@ export default function Page() {
                 </tbody>
               </table>
             </div>
-
-            <div className="mt-3 text-xs text-slate-500">
-              Tip: Use this page to quickly scan start/end dates and clean up old clients.
-            </div>
           </section>
         ) : (
-          // TRACKER PAGE
           <section className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
             {/* Left column */}
             <div className="lg:col-span-1 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
@@ -823,7 +759,7 @@ export default function Page() {
                   Add client
                 </button>
 
-                {/* Upcoming clients */}
+                {/* Upcoming */}
                 <div className="rounded-xl bg-white border border-slate-200 p-3">
                   <div className="flex items-end justify-between gap-2">
                     <div>
@@ -832,9 +768,7 @@ export default function Page() {
                         Clients with a future start date (they’ll get pre-start weekend tasks automatically).
                       </div>
                     </div>
-                    <div className="text-sm text-slate-600">
-                      {upcomingClients.length}
-                    </div>
+                    <div className="text-sm text-slate-600">{upcomingClients.length}</div>
                   </div>
 
                   {upcomingClients.length === 0 ? (
@@ -871,6 +805,7 @@ export default function Page() {
                   )}
                 </div>
 
+                {/* Rules */}
                 <div className="rounded-xl bg-slate-50 border border-slate-200 p-3">
                   <div className="text-xs uppercase tracking-wide text-slate-500">Task rules</div>
 
@@ -880,9 +815,7 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).onboarding.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>
-                              {DAY_NAMES[r.day]}: {r.title}
-                            </span>
+                            <span>{DAY_NAMES[r.day]}: {r.title}</span>
                             <button
                               onClick={() => deleteRule("onboarding", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -899,9 +832,7 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).weekly.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>
-                              {DAY_NAMES[r.day]}: {r.title}
-                            </span>
+                            <span>{DAY_NAMES[r.day]}: {r.title}</span>
                             <button
                               onClick={() => deleteRule("weekly", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -918,9 +849,7 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).week.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>
-                              Week {r.week}: {r.title}
-                            </span>
+                            <span>Week {r.week}: {r.title}</span>
                             <button
                               onClick={() => deleteRule("week", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -962,9 +891,7 @@ export default function Page() {
                             className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
                           >
                             {DAY_NAMES.map((d, i) => (
-                              <option key={d} value={i}>
-                                {d}
-                              </option>
+                              <option key={d} value={i}>{d}</option>
                             ))}
                           </select>
                         )}
@@ -999,15 +926,12 @@ export default function Page() {
 
             {/* Right column */}
             <div className="lg:col-span-2 space-y-4">
-              {/* Controls */}
               <div className="rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
                 <div className="flex flex-col gap-3">
                   <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
                     <div>
                       <h2 className="text-lg font-semibold">Tasks</h2>
-                      <p className="text-sm text-slate-600 mt-1">
-                        Day view for {dayName} ({dateISO})
-                      </p>
+                      <p className="text-sm text-slate-600 mt-1">Day view for {dayName} ({dateISO})</p>
                     </div>
 
                     <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
@@ -1015,19 +939,13 @@ export default function Page() {
                         <div className="flex rounded-xl border border-slate-200 bg-slate-50 p-1">
                           <button
                             onClick={() => setTaskFilter("all")}
-                            className={clsx(
-                              "rounded-lg px-3 py-1.5 text-sm",
-                              taskFilter === "all" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600"
-                            )}
+                            className={clsx("rounded-lg px-3 py-1.5 text-sm", taskFilter === "all" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600")}
                           >
                             All
                           </button>
                           <button
                             onClick={() => setTaskFilter("incomplete")}
-                            className={clsx(
-                              "rounded-lg px-3 py-1.5 text-sm",
-                              taskFilter === "incomplete" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600"
-                            )}
+                            className={clsx("rounded-lg px-3 py-1.5 text-sm", taskFilter === "incomplete" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600")}
                           >
                             Incomplete
                           </button>
@@ -1062,14 +980,11 @@ export default function Page() {
                   </div>
                 </div>
 
-                {/* Program reminder banner */}
                 {!dismissProgramBanner && programAlerts.length > 0 && (
                   <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <div className="text-sm font-semibold text-amber-900">
-                          Program reminder (follow-up / next goal)
-                        </div>
+                        <div className="text-sm font-semibold text-amber-900">Program reminder (follow-up / next goal)</div>
                         <div className="text-sm text-amber-800 mt-1">
                           {programAlerts.map((a, idx) => (
                             <div key={`${a.client.id}-${a.label}-${idx}`}>
@@ -1130,9 +1045,7 @@ export default function Page() {
                             onClick={() => toggleTask(o.dateISO, o.client.id, o.task.id)}
                             className={clsx(
                               "shrink-0 rounded-xl px-3 py-2 text-sm border",
-                              checked
-                                ? "bg-white border-slate-300 text-slate-600"
-                                : "bg-slate-900 border-slate-900 text-white"
+                              checked ? "bg-white border-slate-300 text-slate-600" : "bg-slate-900 border-slate-900 text-white"
                             )}
                             title="Mark done / undo"
                           >
@@ -1145,7 +1058,7 @@ export default function Page() {
                 )}
               </div>
 
-              {/* Client cards (ACTIVE only) */}
+              {/* Client cards */}
               <div className="rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
                 {sortedRows.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center">
@@ -1189,7 +1102,6 @@ export default function Page() {
                             </button>
                           </div>
 
-                          {/* Notes */}
                           <div className="mt-3">
                             <label className="text-xs uppercase tracking-wide text-slate-500">Notes</label>
                             <textarea
@@ -1200,7 +1112,6 @@ export default function Page() {
                             />
                           </div>
 
-                          {/* Tasks */}
                           <div className="mt-3">
                             {tasksToShow.length === 0 ? (
                               <div className="text-sm text-slate-600">No scheduled tasks for this client today.</div>
