@@ -1,8 +1,8 @@
-'use client'
+'use client';
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const STORAGE_KEY = "client-tracker:v7";
+// -------------------- Types --------------------
 
 type ProgramType = "12w" | "6m";
 type ClientGoal = "fat_loss" | "muscle_gain";
@@ -50,9 +50,9 @@ type Completion = {
   };
 };
 
+// -------------------- Constants --------------------
+
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-const DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const DEFAULT_TASK_RULES: TaskRules = {
   onboarding: [
@@ -68,6 +68,8 @@ const DEFAULT_TASK_RULES: TaskRules = {
   ],
   week: [{ id: "wk3", week: 3, title: "Send Referral Message" }],
 };
+
+// -------------------- Small helpers --------------------
 
 function clsx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
@@ -92,17 +94,14 @@ function formatISODate(d: Date) {
   return `${y}-${m}-${day}`;
 }
 
-/**
- * Stable formatting (no locale/Intl differences between server/client)
- * Output example: "Thu, 1 Jan 2026"
- */
-function prettyDateStable(iso: string) {
+function prettyDate(iso: string) {
   const dt = parseISODate(iso);
-  const dow = DAY_SHORT[dt.getDay()];
-  const day = dt.getDate();
-  const mon = MONTH_SHORT[dt.getMonth()];
-  const year = dt.getFullYear();
-  return `${dow}, ${day} ${mon} ${year}`;
+  return dt.toLocaleDateString(undefined, {
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
 function daysBetween(a: Date, b: Date) {
@@ -186,24 +185,6 @@ function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-function loadState(): { clients?: Client[]; taskRules?: TaskRules; completion?: Completion } | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function saveState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // ignore
-  }
-}
-
 // returns the most recent day-of-week strictly BEFORE a given date
 function getPreviousDowBefore(dateISO: string, dow: number) {
   const d = parseISODate(dateISO);
@@ -223,14 +204,17 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
     const preSunISO = getPreviousDowBefore(client.startDate, 0); // Sunday before start
 
     const tasks: Task[] = [];
+    const day = parseISODate(dateISO).getDay();
 
     if (dateISO === preSatISO) {
+      // Saturday onboarding rule(s)
       for (const r of onboarding) {
         if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
       }
     }
 
     if (dateISO === preSunISO) {
+      // Sunday onboarding rule(s)
       for (const r of onboarding) {
         if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
       }
@@ -282,17 +266,35 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
   return { week, tasks, upcoming: false as const };
 }
 
+// -------------------- Cloud State (via /api/state) --------------------
+
+async function fetchCloudState(): Promise<{ clients?: Client[]; taskRules?: TaskRules; completion?: Completion } | null> {
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    const json = await res.json();
+    return (json?.state ?? null) as any;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCloudState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
+  await fetch("/api/state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state),
+  });
+}
+
+// -------------------- Page --------------------
+
 export default function Page() {
-  /**
-   * Hydration fix:
-   * - Render nothing until we're mounted in the browser.
-   * - Avoid server/client date formatting differences.
-   */
+  // Hydration-safe: only compute "today" after mount
   const [mounted, setMounted] = useState(false);
 
   const [todayISO, setTodayISO] = useState<string>("");
-
   const [dateISO, setDateISO] = useState<string>("");
+
   const [clients, setClients] = useState<Client[]>([]);
   const [taskRules, setTaskRules] = useState<TaskRules>(DEFAULT_TASK_RULES);
   const [completion, setCompletion] = useState<Completion>({});
@@ -324,33 +326,58 @@ export default function Page() {
   // Pop-up reminder dismissal
   const [dismissProgramBanner, setDismissProgramBanner] = useState(false);
 
-  useEffect(() => {
-    // mark mounted + set "today" only in the browser
-    setMounted(true);
-    const t = formatISODate(new Date());
-    setTodayISO(t);
-    setDateISO(t);
-    setNewStart(t);
+  // Cloud load/save guards
+  const [cloudLoaded, setCloudLoaded] = useState(false);
+  const skipNextSaveRef = useRef(true);
 
-    const st = loadState();
-    if (st?.clients) {
-      setClients(
-        st.clients.map((c: any) => ({
-          ...c,
-          program: (c.program as ProgramType) || "12w",
-          goal: (c.goal as ClientGoal) || "fat_loss",
-          notes: typeof c.notes === "string" ? c.notes : "",
-        }))
-      );
-    }
-    if (st?.taskRules) setTaskRules(normalizeRules(st.taskRules));
-    if (st?.completion) setCompletion(st.completion);
+  // Mount + load cloud state
+  useEffect(() => {
+    (async () => {
+      setMounted(true);
+
+      const t = formatISODate(new Date());
+      setTodayISO(t);
+      setDateISO(t);
+      setNewStart(t);
+
+      const st = await fetchCloudState();
+
+      if (st?.clients) {
+        setClients(
+          st.clients.map((c: any) => ({
+            ...c,
+            program: (c.program as ProgramType) || "12w",
+            goal: (c.goal as ClientGoal) || "fat_loss",
+            notes: typeof c.notes === "string" ? c.notes : "",
+          }))
+        );
+      }
+
+      if (st?.taskRules) setTaskRules(normalizeRules(st.taskRules));
+      if (st?.completion) setCompletion(st.completion);
+
+      setCloudLoaded(true);
+      // prevent first save from wiping/loading jitter
+      skipNextSaveRef.current = true;
+    })();
   }, []);
 
+  // Auto-save to cloud (debounced)
   useEffect(() => {
-    if (!mounted) return;
-    saveState({ clients, taskRules, completion });
-  }, [clients, taskRules, completion, mounted]);
+    if (!mounted || !cloudLoaded) return;
+
+    // Skip the very first save right after initial load
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false;
+      return;
+    }
+
+    const t = setTimeout(() => {
+      saveCloudState({ clients, taskRules, completion }).catch(console.error);
+    }, 400);
+
+    return () => clearTimeout(t);
+  }, [clients, taskRules, completion, mounted, cloudLoaded]);
 
   function isChecked(dateKey: string, clientId: string, taskId: string) {
     return !!completion?.[dateKey]?.[clientId]?.[taskId];
@@ -415,25 +442,35 @@ export default function Page() {
     });
   }
 
-  const dayName = dateISO ? DAY_NAMES[parseISODate(dateISO).getDay()] : "";
-  const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
+  // If not mounted yet, render a simple loading screen to avoid hydration issues
+  if (!mounted || !dateISO) {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
+        <div className="rounded-2xl bg-white border border-slate-200 shadow-sm p-6 text-sm text-slate-700">
+          Loading…
+        </div>
+      </div>
+    );
+  }
 
+  const dayName = DAY_NAMES[parseISODate(dateISO).getDay()];
+  const weekDates = useMemo(() => getWeekDates(dateISO), [dateISO]);
+
+  // Separate upcoming vs active (based on selected date)
   const upcomingClients = useMemo(() => {
-    if (!dateISO) return [];
     return clients
       .filter((c) => isAfterISO(c.startDate, dateISO))
       .sort((a, b) => a.startDate.localeCompare(b.startDate));
   }, [clients, dateISO]);
 
   const activeClients = useMemo(() => {
-    if (!dateISO) return [];
     return clients
       .filter((c) => !isAfterISO(c.startDate, dateISO))
       .sort((a, b) => a.name.localeCompare(b.name));
   }, [clients, dateISO]);
 
+  // Build base rows for ACTIVE clients only (tracker)
   const baseRows = useMemo(() => {
-    if (!dateISO) return [];
     return activeClients.map((c) => {
       const day = generateTasksForClientOnDate(c, dateISO, taskRules);
       const week = weekDates.map((d) => generateTasksForClientOnDate(c, d, taskRules));
@@ -441,6 +478,7 @@ export default function Page() {
     });
   }, [activeClients, dateISO, taskRules, weekDates]);
 
+  // Search filter
   const searchedRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return baseRows;
@@ -451,10 +489,12 @@ export default function Page() {
     });
   }, [baseRows, search]);
 
+  // Count incomplete for sorting and summary
   function countIncompleteDay(clientId: string, tasks: Task[]) {
     return tasks.reduce((acc, t) => acc + (isChecked(dateISO, clientId, t.id) ? 0 : 1), 0);
   }
 
+  // Sort
   const sortedRows = useMemo(() => {
     const rows = [...searchedRows];
 
@@ -469,6 +509,7 @@ export default function Page() {
         return a.client.name.localeCompare(b.client.name);
       }
 
+      // default: week (ascending)
       if (a.day.week !== b.day.week) return a.day.week - b.day.week;
       return a.client.name.localeCompare(b.client.name);
     });
@@ -476,6 +517,7 @@ export default function Page() {
     return rows;
   }, [searchedRows, sortBy, dateISO, completion]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Progress (selected day only)
   const progress = useMemo(() => {
     let total = 0;
     let done = 0;
@@ -488,6 +530,7 @@ export default function Page() {
     return { total, done };
   }, [sortedRows, dateISO, completion]);
 
+  // Program banner alerts (2nd last / last week)
   const programAlerts = useMemo(() => {
     const alerts: Array<{ client: Client; label: "secondLast" | "last" }> = [];
 
@@ -504,9 +547,11 @@ export default function Page() {
   }, [sortedRows]);
 
   useEffect(() => {
+    // reset banner per date so it can show again on another day
     setDismissProgramBanner(false);
   }, [dateISO]);
 
+  // Overdue (last N days, before selected date)
   const overdue = useMemo(() => {
     const results: Array<{
       client: Client;
@@ -514,8 +559,6 @@ export default function Page() {
       week: number;
       task: Task;
     }> = [];
-
-    if (!dateISO) return results;
 
     for (const row of sortedRows) {
       const c = row.client;
@@ -543,6 +586,7 @@ export default function Page() {
     return results;
   }, [sortedRows, dateISO, completion, taskRules]);
 
+  // All clients page sorting
   const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
   const allClientsSorted = useMemo(() => {
     const arr = [...clients];
@@ -556,9 +600,6 @@ export default function Page() {
     return arr;
   }, [clients, allClientsSort]);
 
-  // IMPORTANT: prevents hydration mismatch by not rendering server HTML at all.
-  if (!mounted) return null;
-
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       <div className="mx-auto max-w-6xl p-6">
@@ -567,7 +608,7 @@ export default function Page() {
             <div>
               <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Client Tracker</h1>
               <p className="text-slate-600 mt-1">
-                Local prototype (browser-saved) • We’ll move to cloud once the workflow is perfect
+                Cloud saved (Supabase) • Accessible on any computer
               </p>
             </div>
 
@@ -626,7 +667,7 @@ export default function Page() {
                   onChange={(e) => setDateISO(e.target.value)}
                   className="rounded-xl border border-slate-300 px-3 py-2 text-sm"
                 />
-                <div className="text-sm text-slate-700">{prettyDateStable(dateISO)}</div>
+                <div className="text-sm text-slate-700">{prettyDate(dateISO)}</div>
               </div>
             </div>
 
@@ -1021,6 +1062,7 @@ export default function Page() {
                   </div>
                 </div>
 
+                {/* Program reminder banner */}
                 {!dismissProgramBanner && programAlerts.length > 0 && (
                   <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4">
                     <div className="flex items-start justify-between gap-3">
@@ -1147,6 +1189,7 @@ export default function Page() {
                             </button>
                           </div>
 
+                          {/* Notes */}
                           <div className="mt-3">
                             <label className="text-xs uppercase tracking-wide text-slate-500">Notes</label>
                             <textarea
@@ -1157,6 +1200,7 @@ export default function Page() {
                             />
                           </div>
 
+                          {/* Tasks */}
                           <div className="mt-3">
                             {tasksToShow.length === 0 ? (
                               <div className="text-sm text-slate-600">No scheduled tasks for this client today.</div>
@@ -1205,14 +1249,14 @@ export default function Page() {
               </div>
 
               <div className="text-xs text-slate-500">
-                Note: This is still local-only storage. Once these updates feel perfect, we’ll move to cloud + logins.
+                Note: This is now cloud-saved (Supabase). Data stays across devices.
               </div>
             </div>
           </section>
         )}
 
         <footer className="mt-8 text-xs text-slate-500">
-          Tip: If you switch devices, data won’t follow yet (localStorage). Cloud upgrade comes next.
+          Tip: Open the site on another computer to confirm the same clients show up.
         </footer>
       </div>
     </div>
