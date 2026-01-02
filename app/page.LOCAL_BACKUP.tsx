@@ -1,8 +1,8 @@
-'use client';
+'use client'
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 
-// -------------------- Types --------------------
+const STORAGE_KEY = "client-tracker:v7";
 
 type ProgramType = "12w" | "6m";
 type ClientGoal = "fat_loss" | "muscle_gain";
@@ -50,9 +50,9 @@ type Completion = {
   };
 };
 
-// -------------------- Constants --------------------
-
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 const DEFAULT_TASK_RULES: TaskRules = {
   onboarding: [
@@ -68,8 +68,6 @@ const DEFAULT_TASK_RULES: TaskRules = {
   ],
   week: [{ id: "wk3", week: 3, title: "Send Referral Message" }],
 };
-
-// -------------------- Helpers --------------------
 
 function clsx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
@@ -94,14 +92,17 @@ function formatISODate(d: Date) {
   return `${y}-${m}-${day}`;
 }
 
-function prettyDate(iso: string) {
+/**
+ * Stable formatting (no locale/Intl differences between server/client)
+ * Output example: "Thu, 1 Jan 2026"
+ */
+function prettyDateStable(iso: string) {
   const dt = parseISODate(iso);
-  return dt.toLocaleDateString(undefined, {
-    weekday: "short",
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-  });
+  const dow = DAY_SHORT[dt.getDay()];
+  const day = dt.getDate();
+  const mon = MONTH_SHORT[dt.getMonth()];
+  const year = dt.getFullYear();
+  return `${dow}, ${day} ${mon} ${year}`;
 }
 
 function daysBetween(a: Date, b: Date) {
@@ -116,6 +117,7 @@ function addDaysISO(iso: string, days: number) {
 }
 
 function isBeforeISO(aISO: string, bISO: string) {
+  // safe because YYYY-MM-DD string compares lexicographically
   return aISO < bISO;
 }
 
@@ -184,9 +186,28 @@ function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
+function loadState(): { clients?: Client[]; taskRules?: TaskRules; completion?: Completion } | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // ignore
+  }
+}
+
 // returns the most recent day-of-week strictly BEFORE a given date
 function getPreviousDowBefore(dateISO: string, dow: number) {
   const d = parseISODate(dateISO);
+  // step back 1 day at least
   d.setDate(d.getDate() - 1);
   while (d.getDay() !== dow) d.setDate(d.getDate() - 1);
   return formatISODate(d);
@@ -195,18 +216,26 @@ function getPreviousDowBefore(dateISO: string, dow: number) {
 function generateTasksForClientOnDate(client: Client, dateISO: string, rules: TaskRules) {
   const { onboarding, weekly, week: weekRules } = normalizeRules(rules);
 
-  // UPCOMING clients (date before start): only pre-start weekend onboarding tasks
+  // UPCOMING clients (date before start): no weekly/milestone/program tasks
+  // BUT: show pre-start weekend tasks (Sat/Sun before start date)
   if (isBeforeISO(dateISO, client.startDate)) {
-    const preSatISO = getPreviousDowBefore(client.startDate, 6);
-    const preSunISO = getPreviousDowBefore(client.startDate, 0);
+    const preSatISO = getPreviousDowBefore(client.startDate, 6); // Saturday before start
+    const preSunISO = getPreviousDowBefore(client.startDate, 0); // Sunday before start
 
     const tasks: Task[] = [];
+
     if (dateISO === preSatISO) {
-      for (const r of onboarding) if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+      for (const r of onboarding) {
+        if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+      }
     }
+
     if (dateISO === preSunISO) {
-      for (const r of onboarding) if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+      for (const r of onboarding) {
+        if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+      }
     }
+
     return { week: 0, tasks, upcoming: true as const };
   }
 
@@ -218,14 +247,20 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
 
   // Onboarding (Week 1 only)
   if (week === 1) {
-    for (const r of onboarding) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+    for (const r of onboarding) {
+      if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
+    }
   }
 
   // Weekly
-  for (const r of weekly) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
+  for (const r of weekly) {
+    if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
+  }
 
   // Milestones
-  for (const r of weekRules) if (r.week === week) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "milestone" });
+  for (const r of weekRules) {
+    if (r.week === week) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "milestone" });
+  }
 
   // Program reminders (2nd last + last week)
   const totalWeeks = getProgramTotalWeeks(client);
@@ -247,40 +282,17 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
   return { week, tasks, upcoming: false as const };
 }
 
-// -------------------- Cloud State (via /api/state) --------------------
-
-async function fetchCloudState(): Promise<{ clients?: Client[]; taskRules?: TaskRules; completion?: Completion } | null> {
-  try {
-    const res = await fetch("/api/state", { cache: "no-store" });
-    const json = await res.json();
-    return (json?.state ?? null) as any;
-  } catch {
-    return null;
-  }
-}
-
-async function saveCloudState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
-  const res = await fetch("/api/state", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(state),
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`Save failed: ${res.status} ${t}`);
-  }
-}
-
-// -------------------- Page --------------------
-
 export default function Page() {
-  // ✅ ALL hooks must be above any conditional return
-
+  /**
+   * Hydration fix:
+   * - Render nothing until we're mounted in the browser.
+   * - Avoid server/client date formatting differences.
+   */
   const [mounted, setMounted] = useState(false);
 
   const [todayISO, setTodayISO] = useState<string>("");
-  const [dateISO, setDateISO] = useState<string>("");
 
+  const [dateISO, setDateISO] = useState<string>("");
   const [clients, setClients] = useState<Client[]>([]);
   const [taskRules, setTaskRules] = useState<TaskRules>(DEFAULT_TASK_RULES);
   const [completion, setCompletion] = useState<Completion>({});
@@ -302,9 +314,6 @@ export default function Page() {
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<"name" | "week" | "start" | "incomplete">("week");
 
-  // All clients page sorting ✅ moved up (was causing crash)
-  const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
-
   // Overdue lookback
   const OVERDUE_LOOKBACK_DAYS = 30;
 
@@ -315,141 +324,33 @@ export default function Page() {
   // Pop-up reminder dismissal
   const [dismissProgramBanner, setDismissProgramBanner] = useState(false);
 
-  // Cloud load/save guards
-  const [cloudLoaded, setCloudLoaded] = useState(false);
-  const skipNextSaveRef = useRef(true);
-
-  // Auto-refresh (polling) guards
-  const lastLocalEditAtRef = useRef<number>(0);
-  const lastCloudSnapshotRef = useRef<string>(""); // to detect changes
-  const applyingRemoteRef = useRef<boolean>(false);
-
-  // Mount + load cloud state
   useEffect(() => {
-    (async () => {
-      setMounted(true);
+    // mark mounted + set "today" only in the browser
+    setMounted(true);
+    const t = formatISODate(new Date());
+    setTodayISO(t);
+    setDateISO(t);
+    setNewStart(t);
 
-      const t = formatISODate(new Date());
-      setTodayISO(t);
-      setDateISO(t);
-      setNewStart(t);
-
-      const st = await fetchCloudState();
-
-      if (st?.clients) {
-        setClients(
-          st.clients.map((c: any) => ({
-            ...c,
-            program: (c.program as ProgramType) || "12w",
-            goal: (c.goal as ClientGoal) || "fat_loss",
-            notes: typeof c.notes === "string" ? c.notes : "",
-          }))
-        );
-      }
-
-      if (st?.taskRules) setTaskRules(normalizeRules(st.taskRules));
-      if (st?.completion) setCompletion(st.completion);
-
-      // ✅ Seed snapshot so first poll doesn't "re-apply"
-      lastCloudSnapshotRef.current = JSON.stringify(st || {});
-
-      setCloudLoaded(true);
-      skipNextSaveRef.current = true;
-    })();
+    const st = loadState();
+    if (st?.clients) {
+      setClients(
+        st.clients.map((c: any) => ({
+          ...c,
+          program: (c.program as ProgramType) || "12w",
+          goal: (c.goal as ClientGoal) || "fat_loss",
+          notes: typeof c.notes === "string" ? c.notes : "",
+        }))
+      );
+    }
+    if (st?.taskRules) setTaskRules(normalizeRules(st.taskRules));
+    if (st?.completion) setCompletion(st.completion);
   }, []);
 
-  // ✅ Auto-refresh (polling) — updates within ~2 seconds
   useEffect(() => {
-    if (!mounted || !cloudLoaded) return;
-
-    const POLL_MS = 2000;            // ✅ 2 seconds
-    const LOCAL_GRACE_MS = 1500;     // don't overwrite if user just edited
-
-    const poll = async () => {
-      try {
-        const st = await fetchCloudState();
-        if (!st) return;
-
-        const snapshot = JSON.stringify(st);
-
-        // first-run seed
-        if (!lastCloudSnapshotRef.current) {
-          lastCloudSnapshotRef.current = snapshot;
-          return;
-        }
-
-        // no change
-        if (snapshot === lastCloudSnapshotRef.current) return;
-
-        // don't overwrite if this browser just edited
-        const msSinceLocalEdit = Date.now() - lastLocalEditAtRef.current;
-        if (msSinceLocalEdit < LOCAL_GRACE_MS) return;
-
-        // Apply remote state safely
-        applyingRemoteRef.current = true;
-        skipNextSaveRef.current = true; // prevent "remote apply" -> immediate re-save loop
-
-        if (st.clients) {
-          setClients(
-            st.clients.map((c: any) => ({
-              ...c,
-              program: (c.program as ProgramType) || "12w",
-              goal: (c.goal as ClientGoal) || "fat_loss",
-              notes: typeof c.notes === "string" ? c.notes : "",
-            }))
-          );
-        } else {
-          setClients([]);
-        }
-
-        if (st.taskRules) setTaskRules(normalizeRules(st.taskRules));
-        else setTaskRules(DEFAULT_TASK_RULES);
-
-        if (st.completion) setCompletion(st.completion);
-        else setCompletion({});
-
-        // ✅ update snapshot once we decide this remote state is our new truth
-        lastCloudSnapshotRef.current = snapshot;
-      } catch (e) {
-        console.error("Auto-refresh poll failed:", e);
-      } finally {
-        // ✅ IMPORTANT: release applyingRemote AFTER React has had a tick to apply state
-        setTimeout(() => {
-          applyingRemoteRef.current = false;
-        }, 0);
-      }
-    };
-
-    poll();
-    const id = setInterval(poll, POLL_MS);
-    return () => clearInterval(id);
-  }, [mounted, cloudLoaded]);
-
-  // ✅ Auto-save to cloud (debounced)
-  useEffect(() => {
-    if (!mounted || !cloudLoaded) return;
-
-    // If we're applying a remote update, don't treat it as a local edit
-    if (!applyingRemoteRef.current) {
-      lastLocalEditAtRef.current = Date.now();
-    }
-
-    if (skipNextSaveRef.current) {
-      skipNextSaveRef.current = false;
-      return;
-    }
-
-    const t = setTimeout(() => {
-      // ✅ IMPORTANT: update snapshot BEFORE saving so poll doesn't "re-apply" our own write
-      lastCloudSnapshotRef.current = JSON.stringify({ clients, taskRules, completion });
-
-      saveCloudState({ clients, taskRules, completion }).catch((e) => {
-        console.error(e);
-      });
-    }, 400);
-
-    return () => clearTimeout(t);
-  }, [clients, taskRules, completion, mounted, cloudLoaded]);
+    if (!mounted) return;
+    saveState({ clients, taskRules, completion });
+  }, [clients, taskRules, completion, mounted]);
 
   function isChecked(dateKey: string, clientId: string, taskId: string) {
     return !!completion?.[dateKey]?.[clientId]?.[taskId];
@@ -495,8 +396,12 @@ export default function Page() {
     const id = uid();
     setTaskRules((prev) => {
       const safe = normalizeRules(prev);
-      if (ruleType === "onboarding") return { ...safe, onboarding: [...safe.onboarding, { id, day: Number(ruleDay), title }] };
-      if (ruleType === "weekly") return { ...safe, weekly: [...safe.weekly, { id, day: Number(ruleDay), title }] };
+      if (ruleType === "onboarding") {
+        return { ...safe, onboarding: [...safe.onboarding, { id, day: Number(ruleDay), title }] };
+      }
+      if (ruleType === "weekly") {
+        return { ...safe, weekly: [...safe.weekly, { id, day: Number(ruleDay), title }] };
+      }
       return { ...safe, week: [...safe.week, { id, week: Math.max(1, Number(ruleWeek) || 1), title }] };
     });
 
@@ -510,16 +415,21 @@ export default function Page() {
     });
   }
 
+  const dayName = dateISO ? DAY_NAMES[parseISODate(dateISO).getDay()] : "";
   const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
 
   const upcomingClients = useMemo(() => {
     if (!dateISO) return [];
-    return clients.filter((c) => isAfterISO(c.startDate, dateISO)).sort((a, b) => a.startDate.localeCompare(b.startDate));
+    return clients
+      .filter((c) => isAfterISO(c.startDate, dateISO))
+      .sort((a, b) => a.startDate.localeCompare(b.startDate));
   }, [clients, dateISO]);
 
   const activeClients = useMemo(() => {
     if (!dateISO) return [];
-    return clients.filter((c) => !isAfterISO(c.startDate, dateISO)).sort((a, b) => a.name.localeCompare(b.name));
+    return clients
+      .filter((c) => !isAfterISO(c.startDate, dateISO))
+      .sort((a, b) => a.name.localeCompare(b.name));
   }, [clients, dateISO]);
 
   const baseRows = useMemo(() => {
@@ -547,18 +457,22 @@ export default function Page() {
 
   const sortedRows = useMemo(() => {
     const rows = [...searchedRows];
+
     rows.sort((a, b) => {
       if (sortBy === "name") return a.client.name.localeCompare(b.client.name);
       if (sortBy === "start") return a.client.startDate.localeCompare(b.client.startDate);
+
       if (sortBy === "incomplete") {
         const ai = countIncompleteDay(a.client.id, a.day.tasks);
         const bi = countIncompleteDay(b.client.id, b.day.tasks);
         if (bi !== ai) return bi - ai;
         return a.client.name.localeCompare(b.client.name);
       }
+
       if (a.day.week !== b.day.week) return a.day.week - b.day.week;
       return a.client.name.localeCompare(b.client.name);
     });
+
     return rows;
   }, [searchedRows, sortBy, dateISO, completion]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -567,20 +481,25 @@ export default function Page() {
     let done = 0;
     for (const row of sortedRows) {
       total += row.day.tasks.length;
-      for (const t of row.day.tasks) if (isChecked(dateISO, row.client.id, t.id)) done += 1;
+      for (const t of row.day.tasks) {
+        if (isChecked(dateISO, row.client.id, t.id)) done += 1;
+      }
     }
     return { total, done };
   }, [sortedRows, dateISO, completion]);
 
   const programAlerts = useMemo(() => {
     const alerts: Array<{ client: Client; label: "secondLast" | "last" }> = [];
+
     for (const row of sortedRows) {
       const c = row.client;
       const week = row.day.week;
       const total = getProgramTotalWeeks(c);
+
       if (week === total - 1) alerts.push({ client: c, label: "secondLast" });
       if (week === total) alerts.push({ client: c, label: "last" });
     }
+
     return alerts;
   }, [sortedRows]);
 
@@ -589,22 +508,42 @@ export default function Page() {
   }, [dateISO]);
 
   const overdue = useMemo(() => {
-    const results: Array<{ client: Client; dateISO: string; week: number; task: Task }> = [];
+    const results: Array<{
+      client: Client;
+      dateISO: string;
+      week: number;
+      task: Task;
+    }> = [];
+
+    if (!dateISO) return results;
+
     for (const row of sortedRows) {
       const c = row.client;
+
       for (let i = 1; i <= OVERDUE_LOOKBACK_DAYS; i++) {
         const dISO = addDaysISO(dateISO, -i);
+
         if (isBeforeISO(dISO, c.startDate)) continue;
+
         const { week, tasks } = generateTasksForClientOnDate(c, dISO, taskRules);
+
         for (const t of tasks) {
-          if (!isChecked(dISO, c.id, t.id)) results.push({ client: c, dateISO: dISO, week, task: t });
+          if (!isChecked(dISO, c.id, t.id)) {
+            results.push({ client: c, dateISO: dISO, week, task: t });
+          }
         }
       }
     }
-    results.sort((a, b) => (a.dateISO !== b.dateISO ? a.dateISO.localeCompare(b.dateISO) : a.client.name.localeCompare(b.client.name)));
+
+    results.sort((a, b) => {
+      if (a.dateISO !== b.dateISO) return a.dateISO.localeCompare(b.dateISO);
+      return a.client.name.localeCompare(b.client.name);
+    });
+
     return results;
   }, [sortedRows, dateISO, completion, taskRules]);
 
+  const [allClientsSort, setAllClientsSort] = useState<"name" | "start" | "end">("name");
   const allClientsSorted = useMemo(() => {
     const arr = [...clients];
     arr.sort((a, b) => {
@@ -617,18 +556,8 @@ export default function Page() {
     return arr;
   }, [clients, allClientsSort]);
 
-  // ✅ Now it’s safe to conditionally return
-  if (!mounted || !dateISO) {
-    return (
-      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center p-6">
-        <div className="rounded-2xl bg-white border border-slate-200 shadow-sm p-6 text-sm text-slate-700">
-          Loading…
-        </div>
-      </div>
-    );
-  }
-
-  const dayName = DAY_NAMES[parseISODate(dateISO).getDay()];
+  // IMPORTANT: prevents hydration mismatch by not rendering server HTML at all.
+  if (!mounted) return null;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -637,9 +566,12 @@ export default function Page() {
           <div className="flex items-start justify-between gap-4">
             <div>
               <h1 className="text-2xl md:text-3xl font-semibold tracking-tight">Client Tracker</h1>
-              <p className="text-slate-600 mt-1">Cloud saved (Supabase) • Accessible on any computer</p>
+              <p className="text-slate-600 mt-1">
+                Local prototype (browser-saved) • We’ll move to cloud once the workflow is perfect
+              </p>
             </div>
 
+            {/* Hamburger menu */}
             <div className="relative">
               <button
                 onClick={() => setMenuOpen((v) => !v)}
@@ -694,7 +626,7 @@ export default function Page() {
                   onChange={(e) => setDateISO(e.target.value)}
                   className="rounded-xl border border-slate-300 px-3 py-2 text-sm"
                 />
-                <div className="text-sm text-slate-700">{prettyDate(dateISO)}</div>
+                <div className="text-sm text-slate-700">{prettyDateStable(dateISO)}</div>
               </div>
             </div>
 
@@ -708,6 +640,7 @@ export default function Page() {
           </div>
         </header>
 
+        {/* ALL CLIENTS PAGE */}
         {activePage === "allClients" ? (
           <section className="mt-6 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
             <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
@@ -751,7 +684,9 @@ export default function Page() {
                     allClientsSorted.map((c) => (
                       <tr key={c.id} className="border-t border-slate-200">
                         <td className="p-3 font-medium">{c.name}</td>
-                        <td className="p-3">{c.goal === "fat_loss" ? "Fat loss" : "Muscle gain"}</td>
+                        <td className="p-3">
+                          {c.goal === "fat_loss" ? "Fat loss" : "Muscle gain"}
+                        </td>
                         <td className="p-3">{c.startDate}</td>
                         <td className="p-3">{getProgramEndDateISO(c)}</td>
                         <td className="p-3">
@@ -776,8 +711,13 @@ export default function Page() {
                 </tbody>
               </table>
             </div>
+
+            <div className="mt-3 text-xs text-slate-500">
+              Tip: Use this page to quickly scan start/end dates and clean up old clients.
+            </div>
           </section>
         ) : (
+          // TRACKER PAGE
           <section className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
             {/* Left column */}
             <div className="lg:col-span-1 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
@@ -842,7 +782,7 @@ export default function Page() {
                   Add client
                 </button>
 
-                {/* Upcoming */}
+                {/* Upcoming clients */}
                 <div className="rounded-xl bg-white border border-slate-200 p-3">
                   <div className="flex items-end justify-between gap-2">
                     <div>
@@ -851,7 +791,9 @@ export default function Page() {
                         Clients with a future start date (they’ll get pre-start weekend tasks automatically).
                       </div>
                     </div>
-                    <div className="text-sm text-slate-600">{upcomingClients.length}</div>
+                    <div className="text-sm text-slate-600">
+                      {upcomingClients.length}
+                    </div>
                   </div>
 
                   {upcomingClients.length === 0 ? (
@@ -888,7 +830,6 @@ export default function Page() {
                   )}
                 </div>
 
-                {/* Rules */}
                 <div className="rounded-xl bg-slate-50 border border-slate-200 p-3">
                   <div className="text-xs uppercase tracking-wide text-slate-500">Task rules</div>
 
@@ -898,7 +839,9 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).onboarding.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>{DAY_NAMES[r.day]}: {r.title}</span>
+                            <span>
+                              {DAY_NAMES[r.day]}: {r.title}
+                            </span>
                             <button
                               onClick={() => deleteRule("onboarding", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -915,7 +858,9 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).weekly.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>{DAY_NAMES[r.day]}: {r.title}</span>
+                            <span>
+                              {DAY_NAMES[r.day]}: {r.title}
+                            </span>
                             <button
                               onClick={() => deleteRule("weekly", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -932,7 +877,9 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).week.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>Week {r.week}: {r.title}</span>
+                            <span>
+                              Week {r.week}: {r.title}
+                            </span>
                             <button
                               onClick={() => deleteRule("week", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -974,7 +921,9 @@ export default function Page() {
                             className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
                           >
                             {DAY_NAMES.map((d, i) => (
-                              <option key={d} value={i}>{d}</option>
+                              <option key={d} value={i}>
+                                {d}
+                              </option>
                             ))}
                           </select>
                         )}
@@ -1009,12 +958,15 @@ export default function Page() {
 
             {/* Right column */}
             <div className="lg:col-span-2 space-y-4">
+              {/* Controls */}
               <div className="rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
                 <div className="flex flex-col gap-3">
                   <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-3">
                     <div>
                       <h2 className="text-lg font-semibold">Tasks</h2>
-                      <p className="text-sm text-slate-600 mt-1">Day view for {dayName} ({dateISO})</p>
+                      <p className="text-sm text-slate-600 mt-1">
+                        Day view for {dayName} ({dateISO})
+                      </p>
                     </div>
 
                     <div className="flex flex-col sm:flex-row gap-2 sm:items-center">
@@ -1022,13 +974,19 @@ export default function Page() {
                         <div className="flex rounded-xl border border-slate-200 bg-slate-50 p-1">
                           <button
                             onClick={() => setTaskFilter("all")}
-                            className={clsx("rounded-lg px-3 py-1.5 text-sm", taskFilter === "all" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600")}
+                            className={clsx(
+                              "rounded-lg px-3 py-1.5 text-sm",
+                              taskFilter === "all" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600"
+                            )}
                           >
                             All
                           </button>
                           <button
                             onClick={() => setTaskFilter("incomplete")}
-                            className={clsx("rounded-lg px-3 py-1.5 text-sm", taskFilter === "incomplete" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600")}
+                            className={clsx(
+                              "rounded-lg px-3 py-1.5 text-sm",
+                              taskFilter === "incomplete" ? "bg-white border border-slate-200 shadow-sm" : "text-slate-600"
+                            )}
                           >
                             Incomplete
                           </button>
@@ -1067,7 +1025,9 @@ export default function Page() {
                   <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <div className="text-sm font-semibold text-amber-900">Program reminder (follow-up / next goal)</div>
+                        <div className="text-sm font-semibold text-amber-900">
+                          Program reminder (follow-up / next goal)
+                        </div>
                         <div className="text-sm text-amber-800 mt-1">
                           {programAlerts.map((a, idx) => (
                             <div key={`${a.client.id}-${a.label}-${idx}`}>
@@ -1128,7 +1088,9 @@ export default function Page() {
                             onClick={() => toggleTask(o.dateISO, o.client.id, o.task.id)}
                             className={clsx(
                               "shrink-0 rounded-xl px-3 py-2 text-sm border",
-                              checked ? "bg-white border-slate-300 text-slate-600" : "bg-slate-900 border-slate-900 text-white"
+                              checked
+                                ? "bg-white border-slate-300 text-slate-600"
+                                : "bg-slate-900 border-slate-900 text-white"
                             )}
                             title="Mark done / undo"
                           >
@@ -1141,7 +1103,7 @@ export default function Page() {
                 )}
               </div>
 
-              {/* Client cards */}
+              {/* Client cards (ACTIVE only) */}
               <div className="rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
                 {sortedRows.length === 0 ? (
                   <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center">
@@ -1243,17 +1205,16 @@ export default function Page() {
               </div>
 
               <div className="text-xs text-slate-500">
-                Note: This is now cloud-saved (Supabase). Data stays across devices.
+                Note: This is still local-only storage. Once these updates feel perfect, we’ll move to cloud + logins.
               </div>
             </div>
           </section>
         )}
 
         <footer className="mt-8 text-xs text-slate-500">
-          Tip: Open the site on another computer to confirm the same clients show up.
+          Tip: If you switch devices, data won’t follow yet (localStorage). Cloud upgrade comes next.
         </footer>
       </div>
     </div>
   );
 }
-
