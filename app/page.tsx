@@ -50,6 +50,12 @@ type Completion = {
   };
 };
 
+type MessageTemplate = {
+  id: string;
+  title: string;
+  body: string;
+};
+
 // -------------------- Constants --------------------
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -59,10 +65,10 @@ const DEFAULT_TASK_RULES: TaskRules = {
     { id: "o1", day: 6, title: "Send meal plan" }, // Saturday
     { id: "o2", day: 0, title: "Check meal prep / ready to start" }, // Sunday
     { id: "o3", day: 1, title: 'Send "good luck" message' }, // Monday
-    { id: "o4", day: 3, title: "Unofficial Mid-Week Check In" }, // Wednesday
+    { id: "o4", day: 3, title: "Unofficial Mid-Week Check In" }, // Wednesday (week 1 only via onboarding)
   ],
   weekly: [
-    { id: "w1", day: 3, title: "Unofficial Mid-Week Check-in" }, // Wednesday
+    { id: "w1", day: 3, title: "Unofficial Mid-Week Check-in" }, // Wednesday (custom cadence below)
     { id: "w2", day: 5, title: "Send Check-in Message" }, // Friday
     { id: "w3", day: 0, title: "Check-in" }, // Sunday
   ],
@@ -192,6 +198,13 @@ function getPreviousDowBefore(dateISO: string, dow: number) {
   return formatISODate(d);
 }
 
+function shouldIncludeMidWeekCheckIn(week: number) {
+  // Weeks 1–4: every week
+  // Week 5+: every 2 weeks (6, 8, 10, ...)
+  if (week <= 4) return true;
+  return week % 2 === 0;
+}
+
 function generateTasksForClientOnDate(client: Client, dateISO: string, rules: TaskRules) {
   const { onboarding, weekly, week: weekRules } = normalizeRules(rules);
 
@@ -222,7 +235,16 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
   }
 
   // Weekly
-  for (const r of weekly) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
+  for (const r of weekly) {
+    if (r.day !== day) continue;
+
+    // Custom cadence for "Unofficial Mid-Week Check-in" (w1)
+    if (r.id === "w1") {
+      if (!shouldIncludeMidWeekCheckIn(week)) continue;
+    }
+
+    tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "weekly" });
+  }
 
   // Milestones
   for (const r of weekRules) if (r.week === week) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "milestone" });
@@ -249,7 +271,12 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
 
 // -------------------- Cloud State (via /api/state) --------------------
 
-async function fetchCloudState(): Promise<{ clients?: Client[]; taskRules?: TaskRules; completion?: Completion } | null> {
+async function fetchCloudState(): Promise<{
+  clients?: Client[];
+  taskRules?: TaskRules;
+  completion?: Completion;
+  messageTemplates?: MessageTemplate[];
+} | null> {
   try {
     const res = await fetch("/api/state", { cache: "no-store" });
     const json = await res.json();
@@ -259,7 +286,12 @@ async function fetchCloudState(): Promise<{ clients?: Client[]; taskRules?: Task
   }
 }
 
-async function saveCloudState(state: { clients: Client[]; taskRules: TaskRules; completion: Completion }) {
+async function saveCloudState(state: {
+  clients: Client[];
+  taskRules: TaskRules;
+  completion: Completion;
+  messageTemplates: MessageTemplate[];
+}) {
   const res = await fetch("/api/state", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -284,6 +316,7 @@ export default function Page() {
   const [clients, setClients] = useState<Client[]>([]);
   const [taskRules, setTaskRules] = useState<TaskRules>(DEFAULT_TASK_RULES);
   const [completion, setCompletion] = useState<Completion>({});
+  const [messageTemplates, setMessageTemplates] = useState<MessageTemplate[]>([]);
 
   // Add client
   const [newName, setNewName] = useState("");
@@ -309,7 +342,7 @@ export default function Page() {
   const OVERDUE_LOOKBACK_DAYS = 30;
 
   // Simple "pages" (hamburger menu)
-  const [activePage, setActivePage] = useState<"tracker" | "allClients">("tracker");
+  const [activePage, setActivePage] = useState<"tracker" | "allClients" | "templates">("tracker");
   const [menuOpen, setMenuOpen] = useState(false);
 
   // Pop-up reminder dismissal
@@ -350,6 +383,16 @@ export default function Page() {
       if (st?.taskRules) setTaskRules(normalizeRules(st.taskRules));
       if (st?.completion) setCompletion(st.completion);
 
+      if (Array.isArray(st?.messageTemplates)) {
+        setMessageTemplates(
+          st!.messageTemplates.map((t: any) => ({
+            id: String(t.id ?? uid()),
+            title: typeof t.title === "string" ? t.title : "New template",
+            body: typeof t.body === "string" ? t.body : "",
+          }))
+        );
+      }
+
       // ✅ Seed snapshot so first poll doesn't "re-apply"
       lastCloudSnapshotRef.current = JSON.stringify(st || {});
 
@@ -362,8 +405,8 @@ export default function Page() {
   useEffect(() => {
     if (!mounted || !cloudLoaded) return;
 
-    const POLL_MS = 2000;            // ✅ 2 seconds
-    const LOCAL_GRACE_MS = 1500;     // don't overwrite if user just edited
+    const POLL_MS = 2000; // ✅ 2 seconds
+    const LOCAL_GRACE_MS = 1500; // don't overwrite if user just edited
 
     const poll = async () => {
       try {
@@ -408,6 +451,18 @@ export default function Page() {
         if (st.completion) setCompletion(st.completion);
         else setCompletion({});
 
+        if (Array.isArray(st.messageTemplates)) {
+          setMessageTemplates(
+            st.messageTemplates.map((t: any) => ({
+              id: String(t.id ?? uid()),
+              title: typeof t.title === "string" ? t.title : "New template",
+              body: typeof t.body === "string" ? t.body : "",
+            }))
+          );
+        } else {
+          setMessageTemplates([]);
+        }
+
         // ✅ update snapshot once we decide this remote state is our new truth
         lastCloudSnapshotRef.current = snapshot;
       } catch (e) {
@@ -441,15 +496,15 @@ export default function Page() {
 
     const t = setTimeout(() => {
       // ✅ IMPORTANT: update snapshot BEFORE saving so poll doesn't "re-apply" our own write
-      lastCloudSnapshotRef.current = JSON.stringify({ clients, taskRules, completion });
+      lastCloudSnapshotRef.current = JSON.stringify({ clients, taskRules, completion, messageTemplates });
 
-      saveCloudState({ clients, taskRules, completion }).catch((e) => {
+      saveCloudState({ clients, taskRules, completion, messageTemplates }).catch((e) => {
         console.error(e);
       });
     }, 400);
 
     return () => clearTimeout(t);
-  }, [clients, taskRules, completion, mounted, cloudLoaded]);
+  }, [clients, taskRules, completion, messageTemplates, mounted, cloudLoaded]);
 
   function isChecked(dateKey: string, clientId: string, taskId: string) {
     return !!completion?.[dateKey]?.[clientId]?.[taskId];
@@ -508,6 +563,24 @@ export default function Page() {
       const safe = normalizeRules(prev);
       return { ...safe, [type]: (safe[type] as any[]).filter((r) => r.id !== id) } as TaskRules;
     });
+  }
+
+  // Message Templates
+  function createNewTemplate() {
+    const t: MessageTemplate = {
+      id: uid(),
+      title: "New template",
+      body: "",
+    };
+    setMessageTemplates((prev) => [t, ...prev]);
+  }
+
+  function updateTemplate(id: string, patch: Partial<MessageTemplate>) {
+    setMessageTemplates((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+  }
+
+  function removeTemplate(id: string) {
+    setMessageTemplates((prev) => prev.filter((t) => t.id !== id));
   }
 
   const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
@@ -601,9 +674,35 @@ export default function Page() {
         }
       }
     }
-    results.sort((a, b) => (a.dateISO !== b.dateISO ? a.dateISO.localeCompare(b.dateISO) : a.client.name.localeCompare(b.client.name)));
+    results.sort((a, b) =>
+      a.dateISO !== b.dateISO ? a.dateISO.localeCompare(b.dateISO) : a.client.name.localeCompare(b.client.name)
+    );
     return results;
   }, [sortedRows, dateISO, completion, taskRules]);
+
+  function markAllOverdueDone() {
+    if (overdue.length === 0) return;
+
+    setCompletion((prev) => {
+      const next: Completion = { ...prev };
+
+      for (const o of overdue) {
+        const dateKey = o.dateISO;
+        const clientId = o.client.id;
+        const taskId = o.task.id;
+
+        const dateObj = { ...(next[dateKey] || {}) };
+        const clientObj = { ...(dateObj[clientId] || {}) };
+
+        clientObj[taskId] = true;
+
+        dateObj[clientId] = clientObj;
+        next[dateKey] = dateObj;
+      }
+
+      return next;
+    });
+  }
 
   const allClientsSorted = useMemo(() => {
     const arr = [...clients];
@@ -654,7 +753,7 @@ export default function Page() {
               </button>
 
               {menuOpen && (
-                <div className="absolute right-0 mt-2 w-52 rounded-2xl border border-slate-200 bg-white shadow-lg p-2 z-50">
+                <div className="absolute right-0 mt-2 w-56 rounded-2xl border border-slate-200 bg-white shadow-lg p-2 z-50">
                   <button
                     onClick={() => {
                       setActivePage("tracker");
@@ -667,6 +766,7 @@ export default function Page() {
                   >
                     Client Tracker
                   </button>
+
                   <button
                     onClick={() => {
                       setActivePage("allClients");
@@ -679,36 +779,113 @@ export default function Page() {
                   >
                     All Clients
                   </button>
+
+                  <button
+                    onClick={() => {
+                      setActivePage("templates");
+                      setMenuOpen(false);
+                    }}
+                    className={clsx(
+                      "w-full text-left rounded-xl px-3 py-2 text-sm hover:bg-slate-50",
+                      activePage === "templates" && "bg-slate-50 font-medium"
+                    )}
+                  >
+                    Message Templates
+                  </button>
                 </div>
               )}
             </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
-            <div className="rounded-2xl bg-white shadow-sm border border-slate-200 px-4 py-3">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Selected day</div>
-              <div className="flex items-center gap-3 mt-1">
-                <input
-                  type="date"
-                  value={dateISO}
-                  onChange={(e) => setDateISO(e.target.value)}
-                  className="rounded-xl border border-slate-300 px-3 py-2 text-sm"
-                />
-                <div className="text-sm text-slate-700">{prettyDate(dateISO)}</div>
+          {/* Hide day/progress header cards on Templates page */}
+          {activePage !== "templates" && (
+            <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+              <div className="rounded-2xl bg-white shadow-sm border border-slate-200 px-4 py-3">
+                <div className="text-xs uppercase tracking-wide text-slate-500">Selected day</div>
+                <div className="flex items-center gap-3 mt-1">
+                  <input
+                    type="date"
+                    value={dateISO}
+                    onChange={(e) => setDateISO(e.target.value)}
+                    className="rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  />
+                  <div className="text-sm text-slate-700">{prettyDate(dateISO)}</div>
+                </div>
               </div>
-            </div>
 
-            <div className="rounded-2xl bg-white shadow-sm border border-slate-200 px-4 py-3">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Progress (selected day)</div>
-              <div className="mt-1 flex items-baseline gap-2">
-                <div className="text-xl font-semibold">{progress.done}</div>
-                <div className="text-sm text-slate-600">/ {progress.total} tasks done</div>
+              <div className="rounded-2xl bg-white shadow-sm border border-slate-200 px-4 py-3">
+                <div className="text-xs uppercase tracking-wide text-slate-500">Progress (selected day)</div>
+                <div className="mt-1 flex items-baseline gap-2">
+                  <div className="text-xl font-semibold">{progress.done}</div>
+                  <div className="text-sm text-slate-600">/ {progress.total} tasks done</div>
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </header>
 
-        {activePage === "allClients" ? (
+        {activePage === "templates" ? (
+          <section className="mt-6 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">Message Templates</h2>
+                <p className="text-sm text-slate-600 mt-1">
+                  Create and edit reusable templates (titles + messages). These save to the cloud.
+                </p>
+              </div>
+
+              <button
+                onClick={createNewTemplate}
+                className="rounded-xl bg-slate-900 text-white px-4 py-2.5 text-sm font-medium hover:bg-slate-800 active:bg-slate-950"
+              >
+                Create new
+              </button>
+            </div>
+
+            {messageTemplates.length === 0 ? (
+              <div className="mt-6 rounded-2xl border border-dashed border-slate-300 p-8 text-center">
+                <div className="text-lg font-medium">No templates yet</div>
+                <div className="text-sm text-slate-600 mt-1">Click “Create new” to add your first message template.</div>
+              </div>
+            ) : (
+              <div className="mt-4 space-y-4">
+                {messageTemplates.map((t) => (
+                  <div key={t.id} className="rounded-2xl border border-slate-200 bg-slate-50/40 p-4">
+                    <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-3">
+                      <div className="flex-1 min-w-0">
+                        <label className="text-xs uppercase tracking-wide text-slate-500">Title</label>
+                        <input
+                          value={t.title}
+                          onChange={(e) => updateTemplate(t.id, { title: e.target.value })}
+                          className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm bg-white"
+                          placeholder="e.g., Mid-week check-in"
+                        />
+
+                        <div className="mt-3">
+                          <label className="text-xs uppercase tracking-wide text-slate-500">Message</label>
+                          <textarea
+                            value={t.body}
+                            onChange={(e) => updateTemplate(t.id, { body: e.target.value })}
+                            className="mt-1 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm min-h-[140px] bg-white"
+                            placeholder="Write your message template here..."
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => removeTemplate(t.id)}
+                        className="shrink-0 rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm hover:bg-slate-100"
+                        title="Remove template"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        ) : activePage === "allClients" ? (
           <section className="mt-6 rounded-2xl bg-white shadow-sm border border-slate-200 p-4">
             <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
               <div>
@@ -915,7 +1092,14 @@ export default function Page() {
                       <ul className="mt-1 text-sm text-slate-700 space-y-1 list-disc pl-5">
                         {normalizeRules(taskRules).weekly.map((r) => (
                           <li key={r.id} className="flex items-center justify-between gap-2">
-                            <span>{DAY_NAMES[r.day]}: {r.title}</span>
+                            <span>
+                              {DAY_NAMES[r.day]}: {r.title}
+                              {r.id === "w1" && (
+                                <span className="ml-2 text-xs text-slate-500">
+                                  (Weeks 1–4 weekly, then every 2 weeks)
+                                </span>
+                              )}
+                            </span>
                             <button
                               onClick={() => deleteRule("weekly", r.id)}
                               className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-100"
@@ -1100,8 +1284,25 @@ export default function Page() {
                       Tasks from the last {OVERDUE_LOOKBACK_DAYS} days (before {dateISO}) that are not ticked.
                     </p>
                   </div>
-                  <div className="text-sm text-slate-600">
-                    Total: <span className="font-medium text-slate-900">{overdue.length}</span>
+
+                  <div className="flex items-center gap-3">
+                    <div className="text-sm text-slate-600">
+                      Total: <span className="font-medium text-slate-900">{overdue.length}</span>
+                    </div>
+
+                    <button
+                      onClick={markAllOverdueDone}
+                      disabled={overdue.length === 0}
+                      className={clsx(
+                        "rounded-xl px-3 py-2 text-sm border",
+                        overdue.length === 0
+                          ? "bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed"
+                          : "bg-slate-900 border-slate-900 text-white hover:bg-slate-800"
+                      )}
+                      title="Mark every overdue task as done"
+                    >
+                      Mark all done
+                    </button>
                   </div>
                 </div>
 
@@ -1256,4 +1457,5 @@ export default function Page() {
     </div>
   );
 }
+
 
