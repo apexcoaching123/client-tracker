@@ -56,16 +56,23 @@ type MessageTemplate = {
   body: string;
 };
 
+type UpcomingTaskDef = { id: string; title: string };
+
 // -------------------- Constants --------------------
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+const UPCOMING_TASKS: UpcomingTaskDef[] = [
+  { id: "prestart:direct-debit", title: "Set up direct debit" },
+  { id: "prestart:meal-plan", title: "Send meal plan" },
+  { id: "prestart:training-plan", title: "Assign training plan" },
+  { id: "prestart:confirm-ready", title: "Confirm ready to start" },
+];
+
 const DEFAULT_TASK_RULES: TaskRules = {
   onboarding: [
-    { id: "o1", day: 6, title: "Send meal plan" }, // Saturday
-    { id: "o2", day: 0, title: "Check meal prep / ready to start" }, // Sunday
-    { id: "o3", day: 1, title: 'Send "good luck" message' }, // Monday
-    { id: "o4", day: 3, title: "Unofficial Mid-Week Check In" }, // Wednesday (week 1 only via onboarding)
+    // ✅ Week 1 onboarding tasks only (NOT pre-start)
+    { id: "o_goodluck", day: 1, title: 'Send "good luck" message' }, // Monday (Week 1 only)
   ],
   weekly: [
     { id: "w1", day: 3, title: "Unofficial Mid-Week Check-in" }, // Wednesday (custom cadence below)
@@ -190,14 +197,6 @@ function uid() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-// returns the most recent day-of-week strictly BEFORE a given date
-function getPreviousDowBefore(dateISO: string, dow: number) {
-  const d = parseISODate(dateISO);
-  d.setDate(d.getDate() - 1);
-  while (d.getDay() !== dow) d.setDate(d.getDate() - 1);
-  return formatISODate(d);
-}
-
 function shouldIncludeMidWeekCheckIn(week: number) {
   // Weeks 1–4: every week
   // Week 5+: every 2 weeks (6, 8, 10, ...)
@@ -208,19 +207,9 @@ function shouldIncludeMidWeekCheckIn(week: number) {
 function generateTasksForClientOnDate(client: Client, dateISO: string, rules: TaskRules) {
   const { onboarding, weekly, week: weekRules } = normalizeRules(rules);
 
-  // UPCOMING clients (date before start): only pre-start weekend onboarding tasks
+  // ✅ UPCOMING clients: no scheduled tasks here (handled in Upcoming Clients UI)
   if (isBeforeISO(dateISO, client.startDate)) {
-    const preSatISO = getPreviousDowBefore(client.startDate, 6);
-    const preSunISO = getPreviousDowBefore(client.startDate, 0);
-
-    const tasks: Task[] = [];
-    if (dateISO === preSatISO) {
-      for (const r of onboarding) if (r.day === 6) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
-    }
-    if (dateISO === preSunISO) {
-      for (const r of onboarding) if (r.day === 0) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
-    }
-    return { week: 0, tasks, upcoming: true as const };
+    return { week: 0, tasks: [] as Task[], upcoming: true as const };
   }
 
   const date = parseISODate(dateISO);
@@ -229,7 +218,7 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
 
   const tasks: Task[] = [];
 
-  // Onboarding (Week 1 only)
+  // ✅ Onboarding (Week 1 only)
   if (week === 1) {
     for (const r of onboarding) if (r.day === day) tasks.push({ id: `rule:${r.id}`, title: r.title, kind: "onboarding" });
   }
@@ -238,7 +227,7 @@ function generateTasksForClientOnDate(client: Client, dateISO: string, rules: Ta
   for (const r of weekly) {
     if (r.day !== day) continue;
 
-    // Custom cadence for "Unofficial Mid-Week Check-in" (w1)
+    // Custom cadence for mid-week check-in (w1)
     if (r.id === "w1") {
       if (!shouldIncludeMidWeekCheckIn(week)) continue;
     }
@@ -468,7 +457,6 @@ export default function Page() {
       } catch (e) {
         console.error("Auto-refresh poll failed:", e);
       } finally {
-        // ✅ IMPORTANT: release applyingRemote AFTER React has had a tick to apply state
         setTimeout(() => {
           applyingRemoteRef.current = false;
         }, 0);
@@ -484,7 +472,6 @@ export default function Page() {
   useEffect(() => {
     if (!mounted || !cloudLoaded) return;
 
-    // If we're applying a remote update, don't treat it as a local edit
     if (!applyingRemoteRef.current) {
       lastLocalEditAtRef.current = Date.now();
     }
@@ -495,7 +482,6 @@ export default function Page() {
     }
 
     const t = setTimeout(() => {
-      // ✅ IMPORTANT: update snapshot BEFORE saving so poll doesn't "re-apply" our own write
       lastCloudSnapshotRef.current = JSON.stringify({ clients, taskRules, completion, messageTemplates });
 
       saveCloudState({ clients, taskRules, completion, messageTemplates }).catch((e) => {
@@ -505,6 +491,8 @@ export default function Page() {
 
     return () => clearTimeout(t);
   }, [clients, taskRules, completion, messageTemplates, mounted, cloudLoaded]);
+
+  // ----- Completion helpers (daily tasks) -----
 
   function isChecked(dateKey: string, clientId: string, taskId: string) {
     return !!completion?.[dateKey]?.[clientId]?.[taskId];
@@ -521,6 +509,30 @@ export default function Page() {
       return next;
     });
   }
+
+  // ----- Completion helpers (upcoming pre-start tasks) -----
+  // We store these under a special "dateKey" that is NOT an ISO date (that’s OK).
+  function upcomingKey(clientId: string) {
+    return `upcoming:${clientId}`;
+  }
+
+  function isUpcomingDone(clientId: string, upcomingTaskId: string) {
+    const key = upcomingKey(clientId);
+    return !!completion?.[key]?.[clientId]?.[upcomingTaskId];
+  }
+
+  function toggleUpcomingTask(clientId: string, upcomingTaskId: string) {
+    const key = upcomingKey(clientId);
+    toggleTask(key, clientId, upcomingTaskId);
+  }
+
+  function upcomingProgress(clientId: string) {
+    const total = UPCOMING_TASKS.length;
+    const done = UPCOMING_TASKS.reduce((acc, t) => acc + (isUpcomingDone(clientId, t.id) ? 1 : 0), 0);
+    return { done, total };
+  }
+
+  // ----- Client actions -----
 
   function addClient() {
     const name = newName.trim();
@@ -542,6 +554,8 @@ export default function Page() {
   function updateClientNotes(id: string, notes: string) {
     setClients((prev) => prev.map((c) => (c.id === id ? { ...c, notes } : c)));
   }
+
+  // ----- Rule actions -----
 
   function addRule() {
     const title = ruleTitle.trim();
@@ -565,7 +579,8 @@ export default function Page() {
     });
   }
 
-  // Message Templates
+  // ----- Message Templates -----
+
   function createNewTemplate() {
     const t: MessageTemplate = {
       id: uid(),
@@ -582,6 +597,8 @@ export default function Page() {
   function removeTemplate(id: string) {
     setMessageTemplates((prev) => prev.filter((t) => t.id !== id));
   }
+
+  // ----- Derived data -----
 
   const weekDates = useMemo(() => (dateISO ? getWeekDates(dateISO) : []), [dateISO]);
 
@@ -797,7 +814,6 @@ export default function Page() {
             </div>
           </div>
 
-          {/* Hide day/progress header cards on Templates page */}
           {activePage !== "templates" && (
             <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
               <div className="rounded-2xl bg-white shadow-sm border border-slate-200 px-4 py-3">
@@ -1025,7 +1041,7 @@ export default function Page() {
                     <div>
                       <div className="text-xs uppercase tracking-wide text-slate-500">Upcoming clients</div>
                       <div className="text-sm text-slate-700 mt-1">
-                        Clients with a future start date (they’ll get pre-start weekend tasks automatically).
+                        Pre-start onboarding tasks live here until they roll into Week 1.
                       </div>
                     </div>
                     <div className="text-sm text-slate-600">{upcomingClients.length}</div>
@@ -1034,10 +1050,9 @@ export default function Page() {
                   {upcomingClients.length === 0 ? (
                     <div className="mt-3 text-sm text-slate-600">No upcoming clients.</div>
                   ) : (
-                    <div className="mt-3 space-y-2 max-h-[240px] overflow-auto pr-1">
+                    <div className="mt-3 space-y-2 max-h-[340px] overflow-auto pr-1">
                       {upcomingClients.map((c) => {
-                        const preSat = getPreviousDowBefore(c.startDate, 6);
-                        const preSun = getPreviousDowBefore(c.startDate, 0);
+                        const prog = upcomingProgress(c.id);
                         return (
                           <div key={c.id} className="rounded-xl border border-slate-200 bg-slate-50/40 p-3">
                             <div className="flex items-start justify-between gap-3">
@@ -1046,8 +1061,34 @@ export default function Page() {
                                 <div className="text-xs text-slate-600 mt-0.5">
                                   Starts: {c.startDate} • Goal: {c.goal === "fat_loss" ? "Fat loss" : "Muscle gain"}
                                 </div>
-                                <div className="text-xs text-slate-500 mt-1">
-                                  Pre-start tasks: {preSat} (Sat) + {preSun} (Sun)
+
+                                <div className="mt-2 flex items-center gap-2">
+                                  <span className="text-xs text-slate-500">Pre-start tasks:</span>
+                                  <span className="text-xs font-medium text-slate-700">
+                                    {prog.done}/{prog.total} done
+                                  </span>
+                                </div>
+
+                                <div className="mt-2 space-y-2">
+                                  {UPCOMING_TASKS.map((t) => {
+                                    const done = isUpcomingDone(c.id, t.id);
+                                    return (
+                                      <label
+                                        key={t.id}
+                                        className="flex items-center gap-2 cursor-pointer select-none rounded-lg bg-white border border-slate-200 px-2 py-1.5"
+                                      >
+                                        <input
+                                          type="checkbox"
+                                          checked={done}
+                                          onChange={() => toggleUpcomingTask(c.id, t.id)}
+                                          className="h-4 w-4"
+                                        />
+                                        <span className={clsx("text-sm", done ? "line-through text-slate-500" : "text-slate-900")}>
+                                          {t.title}
+                                        </span>
+                                      </label>
+                                    );
+                                  })}
                                 </div>
                               </div>
 
@@ -1085,6 +1126,9 @@ export default function Page() {
                           </li>
                         ))}
                       </ul>
+                      <div className="mt-2 text-xs text-slate-500">
+                        Pre-start onboarding tasks are managed in the Upcoming Clients list.
+                      </div>
                     </div>
 
                     <div>
@@ -1457,5 +1501,3 @@ export default function Page() {
     </div>
   );
 }
-
-
